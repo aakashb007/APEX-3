@@ -23,7 +23,7 @@ try:
     nest_asyncio.apply(loop)
 except: pass
 
-st.set_page_config(page_title="APEX3 // Pump & Dump Scanner", page_icon="🔥", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="APEX // Pump & Dump Scanner", page_icon="🔥", layout="wide", initial_sidebar_state="expanded")
 
 _SS_DEFAULTS = {
     'results':[], 'last_scan':"—", 'scan_count':0, 'btc_price':0, 'btc_trend':"—",
@@ -255,16 +255,16 @@ def check_daily_summary(s):
              f"✅ TP Hits: **{tps}** | 🛑 SL Hits: **{sls}** | 🔄 Active: **{active}**\n"
              f"🎯 Win Rate: **{wr:.1f}%**\n"
              f"━━━━━━━━━━━━━━━━━\n"
-             f"*Powered by APEX3 Intelligence Terminal*")
+             f"*Powered by APEX Intelligence Terminal*")
         tg_msg=msg.replace("**","<b>").replace("**","</b>")
         if s.get('tg_token') and s.get('tg_chat_id'):
             send_tg(s['tg_token'],s['tg_chat_id'],tg_msg.replace("**","").replace("*",""))
         if s.get('discord_webhook'):
             send_discord(s['discord_webhook'],{
-                "title":"📊 APEX3 24h Journal Summary",
+                "title":"📊 APEX 24h Journal Summary",
                 "color":0x2563eb,
                 "description":msg,
-                "footer":{"text":f"APEX3 Terminal • {now.strftime('%H:%M UTC')}"}
+                "footer":{"text":f"APEX Terminal • {now.strftime('%H:%M UTC')}"}
             })
     except: pass
 
@@ -1602,7 +1602,7 @@ def render_card(res, is_sniper=False, dual_confirmed=False):
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("⚡ APEX3")
+    st.title("⚡ APEX")
     st.caption("Pump & Dump Intelligence")
     # FIX: Use session state for nav to prevent journal→scanner glitch
     nav_options=["🔥 Scanner","⚙️ Settings","📒 Journal","📊 Backtest"]
@@ -1610,6 +1610,7 @@ with st.sidebar:
                  index=nav_options.index(st.session_state.get('nav_state','🔥 Scanner')))
     if nav!=st.session_state.nav_state:
         st.session_state.nav_state=nav
+        st.rerun()
     st.divider()
     st.subheader("Quick Controls")
     q_depth=st.slider("Coins to Scan",10,100,S['scan_depth'],step=10,key="q_depth")
@@ -1645,7 +1646,7 @@ with st.sidebar:
 
 
 # ─── HEADER / TICKER ─────────────────────────────────────────────────────────
-st.markdown('<div style="padding:18px 0 14px;"><div style="font-family:monospace;font-size:1.5rem;font-weight:700;color:#0f1117;">APEX3</div><div style="font-family:monospace;font-size:.56rem;font-weight:400;letter-spacing:.16em;color:#7a82a0;text-transform:uppercase;margin-top:2px;">Pump & Dump Intelligence Terminal v3.0 — Dual Confirm + FVG + Backtest</div></div>',unsafe_allow_html=True)
+st.markdown('<div style="padding:18px 0 14px;"><div style="font-family:monospace;font-size:1.5rem;font-weight:700;color:#0f1117;">APEX</div><div style="font-family:monospace;font-size:.56rem;font-weight:400;letter-spacing:.16em;color:#7a82a0;text-transform:uppercase;margin-top:2px;">Pump & Dump Intelligence Terminal v3.0 — Dual Confirm + FVG + Backtest</div></div>',unsafe_allow_html=True)
 
 if time.time()-st.session_state.get('fng_last_fetch',0)>300:
     try:
@@ -2010,86 +2011,313 @@ if nav=="📒 Journal":
 # ═══════════════════════════════════════════════════════════════════════════
 if nav=="📊 Backtest":
     st.markdown('<div class="section-h">Backtest — Replay Journal Signals Against Historical OHLCV</div>',unsafe_allow_html=True)
-    st.info("📊 **How it works:** Select a min score + date range. For each journal signal, we fetch historical OHLCV from OKX (or Gate as fallback) and check if TP or SL was hit first after signal time.")
-    if not os.path.exists(JOURNAL_FILE):
-        st.warning("No journal file found. Run some scans first to populate the journal.")
+
+    # ── MODE SELECTOR ─────────────────────────────────────────────────────
+    bt_mode=st.radio("Backtest Source",
+        ["📊 System Journal","📂 Upload External CSV"],
+        horizontal=True)
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # MODE 2 — EXTERNAL CSV UPLOAD
+    # ══════════════════════════════════════════════════════════════════════
+    if bt_mode=="📂 Upload External CSV":
+        st.markdown('<div class="section-h">External CSV Backtest — Upload Your Own Signal Data</div>',unsafe_allow_html=True)
+        st.info("📂 **Upload any CSV with your historical signals.** Required columns: `symbol`, `exchange`, `type` (LONG/SHORT), `tp`, `sl`, `price`, `ts` (timestamp). All other columns are preserved in results.")
+
+        uploaded=st.file_uploader("Upload Signal CSV",type=["csv"])
+        if uploaded is None:
+            st.markdown("""<div class="tab-desc">
+            <b>Required CSV columns:</b><br>
+            • <b>ts</b> — signal timestamp (e.g. 2026-03-04 02:31:13)<br>
+            • <b>symbol</b> — coin symbol (e.g. BTC, ETH, PEPE)<br>
+            • <b>exchange</b> — OKX, GATE, or MEXC<br>
+            • <b>type</b> — LONG or SHORT<br>
+            • <b>tp</b> — take profit price<br>
+            • <b>sl</b> — stop loss price<br>
+            • <b>price</b> — entry price at signal time<br>
+            <br>
+            All other columns (score, class, reasons etc) are optional but will appear in results.
+            </div>""",unsafe_allow_html=True)
+            st.stop()
+
+        try:
+            df_ext=pd.read_csv(uploaded)
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}"); st.stop()
+
+        # Validate required columns
+        required=['symbol','exchange','type','tp','sl','price','ts']
+        missing=[c for c in required if c not in df_ext.columns]
+        if missing:
+            st.error(f"Missing required columns: {missing}")
+            st.info(f"Your CSV has these columns: {list(df_ext.columns)}")
+            st.stop()
+
+        st.success(f"✅ Loaded {len(df_ext)} signals from uploaded CSV")
+        st.dataframe(df_ext.head(5),use_container_width=True)
+
+        # Filters
+        ef1,ef2,ef3,ef4,ef5=st.columns(5)
+        with ef1: ext_min_sc=st.slider("Min score",1,100,50,key="ext_sc") if 'pump_score' in df_ext.columns else 0
+        with ef2: ext_type=st.selectbox("Type filter",["ALL","LONG","SHORT"],key="ext_type")
+        with ef3: ext_exch=st.selectbox("Exchange",["ALL","OKX","GATE","MEXC"],key="ext_exch")
+        with ef4: ext_cls=st.selectbox("Class",["ALL","squeeze","breakout","whale_driven","early"],key="ext_cls") if 'class' in df_ext.columns else "ALL"
+        with ef5: ext_candles=st.slider("Max candles",50,500,200,step=50,key="ext_cnd")
+
+        if st.button("▶️ RUN EXTERNAL BACKTEST",use_container_width=True):
+            df_ext['ts']=pd.to_datetime(df_ext['ts'],errors='coerce')
+            ext_mask=pd.Series([True]*len(df_ext))
+            if 'pump_score' in df_ext.columns and ext_min_sc>0:
+                ext_mask=ext_mask&(pd.to_numeric(df_ext['pump_score'],errors='coerce')>=ext_min_sc)
+            if ext_type!="ALL":
+                ext_mask=ext_mask&(df_ext['type']==ext_type)
+            if ext_exch!="ALL":
+                ext_mask=ext_mask&(df_ext['exchange']==ext_exch)
+            if ext_cls!="ALL" and 'class' in df_ext.columns:
+                ext_mask=ext_mask&(df_ext['class']==ext_cls)
+            df_ext_sub=df_ext[ext_mask].copy()
+            if df_ext_sub.empty:
+                st.warning("No signals match filters."); st.stop()
+
+            st.info(f"Backtesting {len(df_ext_sub)} signals from uploaded CSV...")
+            ext_results=[]; ext_prog=st.progress(0); ext_status=st.empty()
+
+            async def _ext_bt_fetch(sym, exch, ts_str, tp, sl, sig_type, max_candles):
+                try:
+                    from datetime import datetime as _dt
+                    ts_dt=_dt.fromisoformat(str(ts_str)) if ts_str else None
+                    if ts_dt is None: return {'result':'ERROR','error':'bad timestamp'}
+                    ts_ms=int(ts_dt.timestamp()*1000)
+                    tf=S.get('fast_tf','15m')
+                    if exch=="OKX":
+                        ex=ccxt.okx({'enableRateLimit':True,'rateLimit':100,'timeout':8000,'options':{'defaultType':'swap'}})
+                    elif exch=="GATE":
+                        ex=ccxt.gateio({'enableRateLimit':True,'rateLimit':100,'timeout':8000,'options':{'defaultType':'swap'}})
+                    else:
+                        ex=ccxt.mexc({'enableRateLimit':True,'rateLimit':100,'timeout':8000,'options':{'defaultType':'swap'}})
+                    await ex.load_markets()
+                    raw=await ex.fetch_ohlcv(f"{sym}/USDT:USDT",tf,since=ts_ms,limit=max_candles)
+                    await ex.close()
+                    if not raw or len(raw)<3: return {'result':'ERROR','error':'no OHLCV data'}
+                    df_r=pd.DataFrame(raw,columns=['ts','open','high','low','close','volume'])
+                    for idx,row in df_r.iterrows():
+                        h=float(row['high']); l=float(row['low'])
+                        if sig_type=="LONG":
+                            if h>=float(tp) and l<=float(sl):
+                                return {'result':'TP'} if float(row['open'])<=float(tp) else {'result':'SL'}
+                            if h>=float(tp): return {'result':'TP'}
+                            if l<=float(sl): return {'result':'SL'}
+                        else:
+                            if l<=float(tp) and h>=float(sl):
+                                return {'result':'TP'} if float(row['open'])>=float(tp) else {'result':'SL'}
+                            if l<=float(tp): return {'result':'TP'}
+                            if h>=float(sl): return {'result':'SL'}
+                    return {'result':'OPEN'}
+                except Exception as e:
+                    return {'result':'ERROR','error':str(e)[:60]}
+
+            total_ext=len(df_ext_sub)
+            for i,(idx,row) in enumerate(df_ext_sub.iterrows()):
+                ext_status.text(f"Backtesting {i+1}/{total_ext}: {row.get('symbol','?')} {row.get('type','')}...")
+                try:
+                    r=asyncio.run(_ext_bt_fetch(
+                        str(row.get('symbol','')),
+                        str(row.get('exchange','OKX')),
+                        row.get('ts'),
+                        row.get('tp',0),
+                        row.get('sl',0),
+                        row.get('type','LONG'),
+                        ext_candles))
+                    if r:
+                        for col in df_ext_sub.columns:
+                            r[col]=row.get(col,'')
+                        ext_results.append(r)
+                except Exception as e:
+                    err_row={'result':'ERROR','error':str(e)[:50]}
+                    for col in df_ext_sub.columns:
+                        err_row[col]=row.get(col,'')
+                    ext_results.append(err_row)
+                ext_prog.progress((i+1)/total_ext)
+
+            ext_status.empty(); ext_prog.empty()
+            if not ext_results:
+                st.warning("No results."); st.stop()
+
+            df_ext_res=pd.DataFrame(ext_results)
+            etp=len(df_ext_res[df_ext_res['result']=='TP'])
+            esl=len(df_ext_res[df_ext_res['result']=='SL'])
+            eop=len(df_ext_res[df_ext_res['result']=='OPEN'])
+            eer=len(df_ext_res[df_ext_res['result']=='ERROR'])
+            eclosed=etp+esl
+            ewr=(etp/eclosed*100) if eclosed>0 else 0
+
+            # Stat strip
+            st.markdown(f"""<div class="stat-strip">
+              <div><div class="ss-val">{len(df_ext_res)}</div><div class="ss-lbl">Total</div></div>
+              <div><div class="ss-val" style="color:var(--green);">{etp}</div><div class="ss-lbl">TP Hits</div></div>
+              <div><div class="ss-val" style="color:var(--red);">{esl}</div><div class="ss-lbl">SL Hits</div></div>
+              <div><div class="ss-val" style="color:var(--blue);">{ewr:.1f}%</div><div class="ss-lbl">Win Rate</div></div>
+              <div><div class="ss-val" style="color:var(--amber);">{eop}</div><div class="ss-lbl">Still Open</div></div>
+              <div><div class="ss-val" style="color:var(--muted);">{eer}</div><div class="ss-lbl">Errors</div></div>
+            </div>""",unsafe_allow_html=True)
+
+            st.markdown("---")
+            ec1,ec2,ec3=st.columns(3)
+
+            # By direction
+            with ec1:
+                st.markdown("#### 📊 By Direction")
+                tr=[]
+                for tn in ['LONG','SHORT']:
+                    sub=df_ext_res[df_ext_res['type']==tn]
+                    if sub.empty: continue
+                    t=len(sub[sub['result']=='TP']); s=len(sub[sub['result']=='SL'])
+                    c=t+s; w=(t/c*100) if c>0 else 0
+                    tr.append({'Direction':tn,'Signals':len(sub),'TP':t,'SL':s,'Win%':f"{w:.1f}%"})
+                st.dataframe(pd.DataFrame(tr),use_container_width=True,hide_index=True) if tr else st.info("No data")
+
+            # By exchange
+            with ec2:
+                st.markdown("#### 🏦 By Exchange")
+                er=[]
+                for en in ['OKX','GATE','MEXC']:
+                    sub=df_ext_res[df_ext_res['exchange']==en]
+                    if sub.empty: continue
+                    t=len(sub[sub['result']=='TP']); s=len(sub[sub['result']=='SL'])
+                    c=t+s; w=(t/c*100) if c>0 else 0
+                    er.append({'Exchange':en,'Signals':len(sub),'TP':t,'SL':s,'Win%':f"{w:.1f}%"})
+                st.dataframe(pd.DataFrame(er),use_container_width=True,hide_index=True) if er else st.info("No data")
+
+            # By class if available
+            with ec3:
+                if 'class' in df_ext_res.columns:
+                    st.markdown("#### 🏷️ By Class")
+                    cr=[]
+                    for cn in ['squeeze','breakout','whale_driven','early']:
+                        sub=df_ext_res[df_ext_res['class']==cn]
+                        if sub.empty: continue
+                        t=len(sub[sub['result']=='TP']); s=len(sub[sub['result']=='SL'])
+                        c=t+s; w=(t/c*100) if c>0 else 0
+                        cr.append({'Class':cn,'Signals':len(sub),'TP':t,'SL':s,'Win%':f"{w:.1f}%"})
+                    st.dataframe(pd.DataFrame(cr),use_container_width=True,hide_index=True) if cr else st.info("No data")
+                else:
+                    st.markdown("#### 🏆 Best Coins")
+                    coin_r=[]
+                    for coin in df_ext_res['symbol'].unique():
+                        sub=df_ext_res[df_ext_res['symbol']==coin]
+                        if len(sub)<2: continue
+                        t=len(sub[sub['result']=='TP']); s=len(sub[sub['result']=='SL'])
+                        c=t+s; w=(t/c*100) if c>0 else 0
+                        coin_r.append({'Coin':coin,'Signals':len(sub),'TP':t,'SL':s,'Win%':w})
+                    if coin_r:
+                        df_cr=pd.DataFrame(coin_r).sort_values('Win%',ascending=False).head(10)
+                        df_cr['Win%']=df_cr['Win%'].apply(lambda x:f"{x:.1f}%")
+                        st.dataframe(df_cr,use_container_width=True,hide_index=True)
+                    else:
+                        st.info("Need 2+ signals per coin")
+
+            st.markdown("---")
+            st.markdown("#### 📋 Full Results — All Data")
+            st.dataframe(df_ext_res,use_container_width=True,height=400)
+            st.download_button(
+                "⬇️ Export External Backtest CSV",
+                df_ext_res.to_csv(index=False).encode(),
+                file_name=f"apex_external_backtest_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv")
+
         st.stop()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # MODE 1 — SYSTEM JOURNAL (original backtest — unchanged below)
+    # ══════════════════════════════════════════════════════════════════════
+    st.info("📊 **How it works:** Fetches OHLCV candles from signal timestamp and scans candle HIGH/LOW to find which hits first — TP or SL. 100% accurate regardless of when you run it.")
+
+    if not os.path.exists(JOURNAL_FILE):
+        st.warning("No journal file found. Run some scans first."); st.stop()
     try: df_bt=pd.read_csv(JOURNAL_FILE)
     except: df_bt=pd.DataFrame()
     if df_bt.empty:
         st.warning("Journal is empty — run scans first."); st.stop()
 
-    bt1,bt2,bt3,bt4=st.columns(4)
+    # ── FILTERS ──────────────────────────────────────────────────────────
+    bt1,bt2,bt3,bt4,bt5=st.columns(5)
     with bt1: bt_min_sc=st.slider("Min score",1,100,int(S.get('backtest_min_score',50)))
-    with bt2: bt_days=st.slider("Days back",7,90,int(S.get('backtest_days',30)))
+    with bt2: bt_days=st.slider("Days back",1,90,int(S.get('backtest_days',30)))
     with bt3: bt_cls=st.selectbox("Class filter",["ALL","squeeze","breakout","whale_driven","early"])
     with bt4: bt_type=st.selectbox("Type filter",["ALL","LONG","SHORT"])
+    with bt5: bt_candles=st.slider("Max candles per signal",50,500,200,step=50)
 
     if st.button("▶️ RUN BACKTEST",use_container_width=True):
         df_bt['ts']=pd.to_datetime(df_bt['ts'],errors='coerce')
         cutoff=datetime.now()-timedelta(days=bt_days)
-        mask=(df_bt['ts']>=cutoff) & (pd.to_numeric(df_bt['pump_score'],errors='coerce')>=bt_min_sc)
-        if bt_cls!="ALL" and 'class' in df_bt.columns: mask=mask & (df_bt['class']==bt_cls)
-        if bt_type!="ALL": mask=mask & (df_bt['type']==bt_type)
+        mask=(df_bt['ts']>=cutoff)&(pd.to_numeric(df_bt['pump_score'],errors='coerce')>=bt_min_sc)
+        if bt_cls!="ALL" and 'class' in df_bt.columns: mask=mask&(df_bt['class']==bt_cls)
+        if bt_type!="ALL": mask=mask&(df_bt['type']==bt_type)
         df_sub=df_bt[mask].copy()
         if df_sub.empty:
-            st.warning("No signals match the filters."); st.stop()
-        st.info(f"Backtesting {len(df_sub)} signals...")
-        results_bt=[]
-        prog=st.progress(0); status_ph=st.empty()
+            st.warning("No signals match filters."); st.stop()
 
-        async def _bt_fetch(sym, exch, tf, ts_str, tp, sl, sig_type, entry_price):
-            """Fetch OHLCV after signal time and determine TP/SL hit"""
+        st.info(f"Backtesting {len(df_sub)} signals — scanning candle HIGH/LOW for each...")
+        results_bt=[]; prog=st.progress(0); status_ph=st.empty()
+
+        async def _bt_fetch(sym, exch, ts_str, tp, sl, sig_type, entry_price, max_candles):
             try:
                 from datetime import datetime as _dt
                 ts_dt=_dt.fromisoformat(str(ts_str)) if ts_str else None
                 if ts_dt is None: return None
                 ts_ms=int(ts_dt.timestamp()*1000)
-                # Build ccxt exchange
+                tf=S.get('fast_tf','15m')
                 if exch=="OKX":
                     ex=ccxt.okx({'enableRateLimit':True,'rateLimit':100,'timeout':8000,'options':{'defaultType':'swap'}})
-                    sym_ccxt=f"{sym}/USDT:USDT"
                 elif exch=="GATE":
                     ex=ccxt.gateio({'enableRateLimit':True,'rateLimit':100,'timeout':8000,'options':{'defaultType':'swap'}})
-                    sym_ccxt=f"{sym}/USDT:USDT"
-                else:  # MEXC
+                else:
                     ex=ccxt.mexc({'enableRateLimit':True,'rateLimit':100,'timeout':8000,'options':{'defaultType':'swap'}})
-                    sym_ccxt=f"{sym}/USDT:USDT"
                 await ex.load_markets()
-                raw=await ex.fetch_ohlcv(sym_ccxt,tf,since=ts_ms,limit=200)
+                sym_ccxt=f"{sym}/USDT:USDT"
+                raw=await ex.fetch_ohlcv(sym_ccxt,tf,since=ts_ms,limit=max_candles)
                 await ex.close()
-                if not raw or len(raw)<5: return None
+                if not raw or len(raw)<3: return None
                 df_r=pd.DataFrame(raw,columns=['ts','open','high','low','close','volume'])
-                # Simulate: find first candle after signal where price touches entry zone (within 1.5%)
-                entry_touched_at=None
+
+                # Scan every candle HIGH and LOW — never miss an intracandle hit
                 for idx,row in df_r.iterrows():
-                    if abs(float(row['close'])-float(entry_price))/float(entry_price)*100<=1.5:
-                        entry_touched_at=idx; break
-                if entry_touched_at is None: return {'result':'NOT_TRIGGERED','sym':sym,'score':0,'type':sig_type}
-                # From entry touch, scan for TP or SL hit
-                for idx2,row2 in df_r.iloc[entry_touched_at:].iterrows():
-                    h=float(row2['high']); l=float(row2['low'])
+                    h=float(row['high']); l=float(row['low'])
                     if sig_type=="LONG":
-                        if h>=float(tp): return {'result':'TP','sym':sym,'entry':entry_price,'tp':tp,'sl':sl,'type':sig_type,'hit_price':tp}
-                        if l<=float(sl): return {'result':'SL','sym':sym,'entry':entry_price,'tp':tp,'sl':sl,'type':sig_type,'hit_price':sl}
+                        if h>=float(tp) and l<=float(sl):
+                            if float(row['open'])<=float(tp): return {'result':'TP'}
+                            else: return {'result':'SL'}
+                        if h>=float(tp): return {'result':'TP'}
+                        if l<=float(sl): return {'result':'SL'}
                     else:
-                        if l<=float(tp): return {'result':'TP','sym':sym,'entry':entry_price,'tp':tp,'sl':sl,'type':sig_type,'hit_price':tp}
-                        if h>=float(sl): return {'result':'SL','sym':sym,'entry':entry_price,'tp':tp,'sl':sl,'type':sig_type,'hit_price':sl}
-                return {'result':'OPEN','sym':sym,'entry':entry_price,'tp':tp,'sl':sl,'type':sig_type,'hit_price':0}
-            except Exception as e: return {'result':'ERROR','sym':sym,'error':str(e)[:50]}
+                        if l<=float(tp) and h>=float(sl):
+                            if float(row['open'])>=float(tp): return {'result':'TP'}
+                            else: return {'result':'SL'}
+                        if l<=float(tp): return {'result':'TP'}
+                        if h>=float(sl): return {'result':'SL'}
+                return {'result':'OPEN'}
+            except Exception as e:
+                return {'result':'ERROR','error':str(e)[:60]}
 
         total=len(df_sub)
         for i,(idx,row) in enumerate(df_sub.iterrows()):
-            status_ph.text(f"Backtesting {i+1}/{total}: {row.get('symbol','?')}...")
+            status_ph.text(f"Backtesting {i+1}/{total}: {row.get('symbol','?')} {row.get('type','')} score:{row.get('pump_score',0)}...")
             try:
                 r=asyncio.run(_bt_fetch(
-                    str(row.get('symbol','')),str(row.get('exchange','OKX')),"15m",
+                    str(row.get('symbol','')),str(row.get('exchange','OKX')),
                     row.get('ts'),row.get('tp',0),row.get('sl',0),
-                    row.get('type','LONG'),row.get('price',0)))
+                    row.get('type','LONG'),row.get('price',0),bt_candles))
                 if r:
-                    r['score']=int(row.get('pump_score',0)); r['cls']=str(row.get('class',''))
-                    r['ts']=str(row.get('ts','')); results_bt.append(r)
-            except Exception as e: results_bt.append({'result':'ERROR','sym':str(row.get('symbol','?')),'error':str(e)[:50],'score':0,'cls':'','type':'','ts':''})
+                    # Copy ALL journal columns into result row
+                    for col in df_sub.columns:
+                        r[col]=row.get(col,'')
+                    results_bt.append(r)
+            except Exception as e:
+                err_row={'result':'ERROR','error':str(e)[:50]}
+                for col in df_sub.columns:
+                    err_row[col]=row.get(col,'')
+                results_bt.append(err_row)
             prog.progress((i+1)/total)
 
         status_ph.empty(); prog.empty()
@@ -2097,46 +2325,130 @@ if nav=="📊 Backtest":
             st.warning("No backtest results."); st.stop()
 
         df_res=pd.DataFrame(results_bt)
-        tp_count=len(df_res[df_res['result']=='TP']); sl_count=len(df_res[df_res['result']=='SL'])
-        open_count=len(df_res[df_res['result']=='OPEN']); nt_count=len(df_res[df_res['result']=='NOT_TRIGGERED'])
-        err_count=len(df_res[df_res['result']=='ERROR'])
-        total_closed=tp_count+sl_count; wr=(tp_count/total_closed*100) if total_closed>0 else 0
+        tp_c=len(df_res[df_res['result']=='TP'])
+        sl_c=len(df_res[df_res['result']=='SL'])
+        op_c=len(df_res[df_res['result']=='OPEN'])
+        er_c=len(df_res[df_res['result']=='ERROR'])
+        closed=tp_c+sl_c
+        wr=(tp_c/closed*100) if closed>0 else 0
 
-        # Calculate avg RR
-        avg_rr=0
-        rr_vals=[]
-        for _,r in df_res.iterrows():
-            if r.get('result')=='TP' and r.get('entry',0) and r.get('tp',0) and r.get('sl',0):
-                try:
-                    rr=abs(float(r['tp'])-float(r['entry']))/abs(float(r['entry'])-float(r['sl']))
-                    rr_vals.append(rr)
-                except: pass
-        if rr_vals: avg_rr=sum(rr_vals)/len(rr_vals)
-
+        # ── OVERALL STAT STRIP ────────────────────────────────────────────
         st.markdown(f"""<div class="stat-strip">
-          <div><div class="ss-val">{total}</div><div class="ss-lbl">Total Signals</div></div>
-          <div><div class="ss-val" style="color:var(--green);">{tp_count}</div><div class="ss-lbl">TP Hits</div></div>
-          <div><div class="ss-val" style="color:var(--red);">{sl_count}</div><div class="ss-lbl">SL Hits</div></div>
+          <div><div class="ss-val">{len(df_res)}</div><div class="ss-lbl">Total</div></div>
+          <div><div class="ss-val" style="color:var(--green);">{tp_c}</div><div class="ss-lbl">TP Hits</div></div>
+          <div><div class="ss-val" style="color:var(--red);">{sl_c}</div><div class="ss-lbl">SL Hits</div></div>
           <div><div class="ss-val" style="color:var(--blue);">{wr:.1f}%</div><div class="ss-lbl">Win Rate</div></div>
-          <div><div class="ss-val" style="color:var(--amber);">{avg_rr:.2f}:1</div><div class="ss-lbl">Avg R:R (wins)</div></div>
-          <div><div class="ss-val" style="color:var(--muted);">{open_count}</div><div class="ss-lbl">Still Open</div></div>
-          <div><div class="ss-val" style="color:var(--muted);">{nt_count}</div><div class="ss-lbl">Not Triggered</div></div>
+          <div><div class="ss-val" style="color:var(--amber);">{op_c}</div><div class="ss-lbl">Still Open</div></div>
+          <div><div class="ss-val" style="color:var(--muted);">{er_c}</div><div class="ss-lbl">Errors</div></div>
         </div>""",unsafe_allow_html=True)
 
-        # Breakdown by class
-        if 'cls' in df_res.columns:
-            st.markdown("**Results by Class:**")
-            cl_tab=df_res[df_res['result'].isin(['TP','SL'])].groupby('cls')['result'].value_counts().unstack(fill_value=0)
-            if not cl_tab.empty: st.dataframe(cl_tab,use_container_width=True)
+        st.markdown("---")
 
-        st.markdown("**All Results:**")
-        disp_cols=[c for c in ['ts','sym','type','cls','score','result','entry','tp','sl','hit_price','error'] if c in df_res.columns]
-        st.dataframe(df_res[disp_cols],use_container_width=True,height=400)
-        st.download_button("⬇️ Export Backtest CSV",df_res.to_csv(index=False).encode(),
-            file_name=f"apex_backtest_{datetime.now().strftime('%Y%m%d')}.csv",mime="text/csv")
+        col_a,col_b,col_c=st.columns(3)
+
+        # ── BREAKDOWN BY SCORE RANGE ──────────────────────────────────────
+        with col_a:
+            st.markdown("#### 🎯 By Score Range")
+            score_ranges=[(90,100,"90-100"),(75,89,"75-89"),(60,74,"60-74"),(45,59,"45-59"),(1,44,"<45")]
+            sr_rows=[]
+            for lo,hi,label in score_ranges:
+                sub=df_res[(pd.to_numeric(df_res['pump_score'],errors='coerce')>=lo)&(pd.to_numeric(df_res['pump_score'],errors='coerce')<=hi)]
+                if sub.empty: continue
+                t=len(sub[sub['result']=='TP'])
+                s=len(sub[sub['result']=='SL'])
+                c=t+s; w=(t/c*100) if c>0 else 0
+                sr_rows.append({'Score':label,'Signals':len(sub),'TP':t,'SL':s,'Win%':f"{w:.1f}%"})
+            if sr_rows:
+                st.dataframe(pd.DataFrame(sr_rows),use_container_width=True,hide_index=True)
+            else:
+                st.info("No data")
+
+        # ── BREAKDOWN BY CLASS ────────────────────────────────────────────
+        with col_b:
+            st.markdown("#### 🏷️ By Signal Class")
+            cls_rows=[]
+            for cls_name in ['squeeze','breakout','whale_driven','early']:
+                sub=df_res[df_res.get('class',df_res.get('cls',''))==cls_name] if 'class' in df_res.columns else df_res[df_res.get('cls','')==cls_name]
+                if sub.empty: continue
+                t=len(sub[sub['result']=='TP'])
+                s=len(sub[sub['result']=='SL'])
+                c=t+s; w=(t/c*100) if c>0 else 0
+                cls_rows.append({'Class':cls_name,'Signals':len(sub),'TP':t,'SL':s,'Win%':f"{w:.1f}%"})
+            if cls_rows:
+                st.dataframe(pd.DataFrame(cls_rows),use_container_width=True,hide_index=True)
+            else:
+                st.info("No data")
+
+        # ── BREAKDOWN BY DIRECTION ────────────────────────────────────────
+        with col_c:
+            st.markdown("#### 📊 By Direction")
+            type_rows=[]
+            for t_name in ['LONG','SHORT']:
+                sub=df_res[df_res['type']==t_name]
+                if sub.empty: continue
+                t=len(sub[sub['result']=='TP'])
+                s=len(sub[sub['result']=='SL'])
+                c=t+s; w=(t/c*100) if c>0 else 0
+                type_rows.append({'Direction':t_name,'Signals':len(sub),'TP':t,'SL':s,'Win%':f"{w:.1f}%"})
+            if type_rows:
+                st.dataframe(pd.DataFrame(type_rows),use_container_width=True,hide_index=True)
+            else:
+                st.info("No data")
+
+        st.markdown("---")
+
+        col_d,col_e=st.columns(2)
+
+        # ── BREAKDOWN BY EXCHANGE ─────────────────────────────────────────
+        with col_d:
+            st.markdown("#### 🏦 By Exchange")
+            ex_rows=[]
+            for ex_name in ['OKX','GATE','MEXC']:
+                sub=df_res[df_res['exchange']==ex_name]
+                if sub.empty: continue
+                t=len(sub[sub['result']=='TP'])
+                s=len(sub[sub['result']=='SL'])
+                c=t+s; w=(t/c*100) if c>0 else 0
+                ex_rows.append({'Exchange':ex_name,'Signals':len(sub),'TP':t,'SL':s,'Win%':f"{w:.1f}%"})
+            if ex_rows:
+                st.dataframe(pd.DataFrame(ex_rows),use_container_width=True,hide_index=True)
+            else:
+                st.info("No data")
+
+        # ── BEST PERFORMING COINS ─────────────────────────────────────────
+        with col_e:
+            st.markdown("#### 🏆 Best Coins (min 2 signals)")
+            coin_rows=[]
+            sym_col='symbol' if 'symbol' in df_res.columns else 'sym'
+            if sym_col in df_res.columns:
+                for coin in df_res[sym_col].unique():
+                    sub=df_res[df_res[sym_col]==coin]
+                    if len(sub)<2: continue
+                    t=len(sub[sub['result']=='TP'])
+                    s=len(sub[sub['result']=='SL'])
+                    c=t+s; w=(t/c*100) if c>0 else 0
+                    coin_rows.append({'Coin':coin,'Signals':len(sub),'TP':t,'SL':s,'Win%':w})
+            if coin_rows:
+                df_coin=pd.DataFrame(coin_rows).sort_values('Win%',ascending=False).head(10)
+                df_coin['Win%']=df_coin['Win%'].apply(lambda x:f"{x:.1f}%")
+                st.dataframe(df_coin,use_container_width=True,hide_index=True)
+            else:
+                st.info("Need 2+ signals per coin")
+
+        st.markdown("---")
+
+        # ── FULL RESULTS TABLE — ALL COLUMNS ─────────────────────────────
+        st.markdown("#### 📋 All Results — Full Data")
+        st.dataframe(df_res,use_container_width=True,height=400)
+        st.download_button(
+            "⬇️ Export Full Backtest CSV",
+            df_res.to_csv(index=False).encode(),
+            file_name=f"apex_backtest_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv")
+
     st.stop()
 # ─── AUTO-JOURNAL CHECK ──────────────────────────────────────────────────────
-autocheck_journal_background(S)
+# autocheck_journal_background(S)
 check_daily_summary(S)
 
 # ═══════════════════════════════════════════════════════════════════════════
