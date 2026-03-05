@@ -78,6 +78,7 @@ DEFAULT_SETTINGS = {
     "vol_surge_explosive":5.0,"pts_vol_explosive":20,"pts_orderflow":12,
     "orderflow_lookback":10,"pts_liq_map":15,"listing_alert_pts":25,
     "onchain_whale_min":500000,"pts_onchain_whale":15,
+    "pts_wyckoff":30,"pts_cvd":20,"pts_stophunt":25,
     "journal_autocheck_on":True,"journal_autocheck_mins":15,
     "late_entry_chg_thresh":8.0,"late_entry_penalty":20,"vol_exhaust_penalty":15,
     "near_top_penalty":15,"use_4h_ob_for_sl":True,
@@ -1206,6 +1207,123 @@ class PrePumpScreener:
             elif onchain['signal']=='BULLISH' and sig=='SHORT': onchain_sc=-(pts_oc//2); reasons.append(f"⚠️ On-chain bullish conflicts with SHORT")
             elif onchain['signal']=='BEARISH' and sig=='LONG':  onchain_sc=-(pts_oc//2); reasons.append(f"⚠️ On-chain bearish conflicts with LONG")
         pump_score+=onchain_sc; bd['onchain']=onchain_sc
+        # 18 ── WYCKOFF SPRING DETECTOR ──────────────────────────────────────
+        wyckoff_sc = 0
+        try:
+            closes = df_f['close'].values
+            highs = df_f['high'].values
+            lows = df_f['low'].values
+            volumes = df_f['volume'].values
+            if len(closes) >= 20:
+                # Find range over last 20 candles
+                range_hi = float(max(highs[-20:-2]))
+                range_lo = float(min(lows[-20:-2]))
+                range_size = range_hi - range_lo
+                last_low = float(lows[-1])
+                last_close = float(closes[-1])
+                last_vol = float(volumes[-1])
+                avg_vol = float(df_f['volume'].rolling(20).mean().iloc[-1])
+                # Spring conditions:
+                # 1. Price was ranging (range exists)
+                # 2. Last candle wicked BELOW range low (stop hunt)
+                # 3. Last candle CLOSED BACK ABOVE range low (immediate recovery)
+                # 4. Volume spike on the wick candle
+                if range_size > 0:
+                    wick_below = last_low < range_lo
+                    recovered = last_close > range_lo
+                    vol_spike = last_vol > avg_vol * 1.5
+                    range_contract = range_size / price < 0.08  # price was in tight range
+                    if wick_below and recovered and vol_spike and sig == 'LONG':
+                        wyckoff_sc = 30
+                        reasons.append(f"🎯 WYCKOFF SPRING: Wick swept ${range_lo:.6f} support then recovered — stop hunt complete, reversal imminent")
+                    elif wick_below and recovered and sig == 'LONG':
+                        wyckoff_sc = 15
+                        reasons.append(f"🎯 Wyckoff spring pattern — wick below support recovered")
+        except: pass
+        pump_score += wyckoff_sc; bd['wyckoff_spring'] = wyckoff_sc
+
+        # 19 ── CVD DIVERGENCE ────────────────────────────────────────────────
+        cvd_sc = 0
+        try:
+            if len(df_f) >= 15:
+                # CVD = cumulative sum of (close > open ? volume : -volume)
+                df_cvd = df_f.copy()
+                df_cvd['delta'] = df_cvd.apply(
+                    lambda r: float(r['volume']) if float(r['close']) > float(r['open'])
+                    else -float(r['volume']), axis=1)
+                df_cvd['cvd'] = df_cvd['delta'].cumsum()
+                cvd_vals = df_cvd['cvd'].values
+                price_vals = df_cvd['close'].values
+                # Last 10 candles
+                cvd_now = float(cvd_vals[-3:].mean())
+                cvd_prev = float(cvd_vals[-13:-10].mean())
+                price_now = float(price_vals[-3:].mean())
+                price_prev = float(price_vals[-13:-10].mean())
+                price_up = price_now > price_prev
+                price_down = price_now < price_prev
+                cvd_up = cvd_now > cvd_prev
+                cvd_down = cvd_now < cvd_prev
+                if sig == 'LONG' and price_down and cvd_up:
+                    # Price falling but buying pressure increasing = accumulation
+                    cvd_sc = 20
+                    reasons.append(f"📊 CVD DIVERGENCE: Price dropping but buy volume accumulating — market maker absorbing sells")
+                elif sig == 'SHORT' and price_up and cvd_down:
+                    # Price rising but selling pressure increasing = distribution
+                    cvd_sc = 20
+                    reasons.append(f"📊 CVD DIVERGENCE: Price rising but sell volume dominating — market maker distributing into pumps")
+                elif sig == 'LONG' and price_down and cvd_up == False and cvd_down == False:
+                    cvd_sc = 8
+                    reasons.append(f"📊 CVD neutral on price drop — no panic selling")
+        except: pass
+        pump_score += cvd_sc; bd['cvd_divergence'] = cvd_sc
+
+        # 20 ── STOP HUNT ZONE DETECTOR ──────────────────────────────────────
+        stophunt_sc = 0
+        try:
+            if len(df_f) >= 10:
+                closes = df_f['close'].values
+                lows = df_f['low'].values
+                highs = df_f['high'].values
+                current_price = price
+                # Round number proximity (stop hunts cluster at round numbers)
+                magnitude = 10 ** (len(str(int(price))) - 1)
+                nearest_round = round(price / magnitude) * magnitude
+                dist_round = abs(price - nearest_round) / price * 100
+                # Swing low/high from last 10 candles
+                swing_lo_10 = float(min(lows[-10:-1]))
+                swing_hi_10 = float(max(highs[-10:-1]))
+                dist_swing_lo = abs(price - swing_lo_10) / price * 100
+                dist_swing_hi = abs(price - swing_hi_10) / price * 100
+                if sig == 'LONG':
+                    # Price near swing low = stop hunt zone for longs
+                    near_swing_lo = dist_swing_lo <= 1.5
+                    near_round_dn = dist_round <= 1.0 and price < nearest_round
+                    # Funding negative here = extra confirmation
+                    funding_neg = fr < -0.0001
+                    if near_swing_lo and funding_neg:
+                        stophunt_sc = 25
+                        reasons.append(f"🎯 STOP HUNT ZONE: Price at swing low ${swing_lo_10:.6f} + negative funding — market maker trap, reversal likely")
+                    elif near_swing_lo:
+                        stophunt_sc = 12
+                        reasons.append(f"🎯 Stop hunt zone: Price at key swing low ${swing_lo_10:.6f} — stops likely below here")
+                    elif near_round_dn and funding_neg:
+                        stophunt_sc = 15
+                        reasons.append(f"🎯 Stop hunt at round number ${nearest_round:.4f} + negative funding — classic MM trap")
+                elif sig == 'SHORT':
+                    near_swing_hi = dist_swing_hi <= 1.5
+                    near_round_up = dist_round <= 1.0 and price > nearest_round
+                    funding_pos = fr > 0.0001
+                    if near_swing_hi and funding_pos:
+                        stophunt_sc = 25
+                        reasons.append(f"🎯 STOP HUNT ZONE: Price at swing high ${swing_hi_10:.6f} + positive funding — distribution trap")
+                    elif near_swing_hi:
+                        stophunt_sc = 12
+                        reasons.append(f"🎯 Stop hunt zone: Price at swing high ${swing_hi_10:.6f}")
+                    elif near_round_up and funding_pos:
+                        stophunt_sc = 15
+                        reasons.append(f"🎯 Stop hunt at round number ${nearest_round:.4f} + positive funding")
+        except: pass
+        pump_score += stophunt_sc; bd['stop_hunt'] = stophunt_sc
         pump_score=max(0,min(pump_score,100))
 
         # ── ACCURACY GATES ────────────────────────────────────────────────
