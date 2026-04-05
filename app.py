@@ -350,139 +350,413 @@ def _gl_check_loser_breakdown(df_5m, df_4h, s, symbol):
     except:
         return None
 
-def _gl_check_pregainer(df_5m, df_4h, s, symbol):
+# ═══════════════════════════════════════════════════════════════════════════
+# PRE-GAINER / PRE-LOSER — HIGH CONVICTION LOGIC
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# CONVICTION SCORING SYSTEM:
+# Each condition adds points. Signal only fires if score >= threshold.
+# This replaces simple pass/fail filters with a weighted approach.
+#
+# PRE-GAINER conditions (LONG setup forming):
+#   [V1] Vol spike last 1 candle:  ratio >= 3x  → +30 pts  (must have)
+#                                  ratio >= 2x  → +20 pts
+#   [V2] Vol trend: avg last 3 candles > avg 3 before → +15 pts
+#   [V3] 4H mild uptrend: +0.5% to +3.0%  → +20 pts      (must have)
+#   [V4] 1H positive momentum: chg_1h > 0  → +10 pts
+#   [V5] RSI in ideal accumulation: 45-60   → +15 pts
+#        RSI acceptable: 40-65              → +8  pts
+#   [V6] SuperTrend 5m bullish             → +20 pts      (must have)
+#   [V7] SuperTrend 4H bullish             → +15 pts
+#   [V8] Within 1.5% of 4H resistance     → +20 pts      (near trigger)
+#        Within 3.0% of 4H resistance     → +10 pts
+#   [V9] Price above 20-bar EMA on 5m     → +10 pts
+#  [V10] Higher lows pattern (last 3 swings)→ +15 pts
+#  [V11] Last candle bullish (close > open)→ +10 pts
+#  [V12] Candle body > 60% of range        → +10 pts (strong close)
+#  [V13] Min R:R >= 2.0                    → +15 pts
+#        Min R:R >= 1.5                    → +8  pts
+#
+# Total possible: ~185 pts. Threshold: 90 pts (high), 110 pts (star)
+#
+# PRE-LOSER mirrors same logic inverted (SHORT setup).
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _score_pregainer(df_5m, df_4h, s):
+    """
+    Returns (score, reasons, tpsl, close_now, rsi_now, vol_ratio, chg_4h, chg_1h)
+    or None if any hard veto fails.
+    """
     try:
-        chg_4h = _gl_pct_change(df_4h)
-        c = df_5m['close']; h = df_5m['high']; l = df_5m['low']; v = df_5m['volume']
+        c = df_5m['close']; h = df_5m['high']; l = df_5m['low']
+        o = df_5m['open'];  v = df_5m['volume']
+        c4 = df_4h['close']; h4 = df_4h['high']; l4 = df_4h['low']
+
         close_now = float(c.iloc[-1])
-        rsi_now   = float(_dst_rsi(c).iloc[-1])
+        open_now  = float(o.iloc[-1])
+        high_now  = float(h.iloc[-1])
+        low_now   = float(l.iloc[-1])
+
         vol_ma    = v.rolling(20).mean()
-        vol_now   = float(v.iloc[-1]); volma = float(vol_ma.iloc[-1])
+        volma     = float(vol_ma.iloc[-1])
         if volma <= 0: return None
+        vol_now   = float(v.iloc[-1])
         vol_ratio = vol_now / volma
-        if vol_ratio < 1.3: return None
-        if not (35 < rsi_now < 65): return None
-        recent_high = float(h.iloc[-24:].max())
-        near_breakout = (recent_high - close_now) / recent_high * 100 < 2.0
-        if not near_breakout: return None
-        _, st_dir = _dst_supertrend(h, l, c, 3.0, 10)
-        if float(st_dir.iloc[-1]) != 1: return None
+
+        chg_4h    = _gl_pct_change(df_4h)
+        chg_1h    = _gl_pct_change_1h(df_5m)
+        rsi_now   = float(_dst_rsi(c).iloc[-1])
+
+        # ── HARD VETOES (instant disqualify) ──────────────────────────────
+        # V1: Must have at least 2x vol spike on last candle
+        if vol_ratio < 2.0: return None
+        # V3: 4H must show mild uptrend — not falling, not already pumped
+        if not (0.3 <= chg_4h <= 4.0): return None
+        # V6: 5m SuperTrend must be bullish
+        _, st_dir_5m = _dst_supertrend(h, l, c, 3.0, 10)
+        if float(st_dir_5m.iloc[-1]) != 1: return None
+        # RSI must not be overbought (already late)
+        if rsi_now > 68: return None
+        # RSI must not be oversold (wrong context for pre-gainer)
+        if rsi_now < 35: return None
+
+        score   = 0
+        reasons = []
+
+        # ── VOLUME (max 40 + bonus 10) ───────────────────────────────────
+        # Most important predictor — highest weight
+        if vol_ratio >= 4.0:
+            score += 40; reasons.append(f'🔥 Vol {vol_ratio:.1f}x EXTREME')
+        elif vol_ratio >= 3.0:
+            score += 28; reasons.append(f'🔥 Vol {vol_ratio:.1f}x SURGE')
+        elif vol_ratio >= 2.5:
+            score += 18; reasons.append(f'⚡ Vol {vol_ratio:.1f}x spike')
+        else:
+            score += 8;  reasons.append(f'Vol {vol_ratio:.1f}x above avg')
+
+        vol_recent = float(v.iloc[-3:].mean())
+        vol_prior  = float(v.iloc[-6:-3].mean())
+        if vol_prior > 0 and vol_recent > vol_prior * 1.2:
+            score += 10; reasons.append('📈 Vol accelerating')
+
+        # ── 4H TREND (max 18) ────────────────────────────────────────────
+        if 0.5 <= chg_4h <= 2.0:
+            score += 18; reasons.append(f'4H up {chg_4h:+.1f}% ideal')
+        elif 2.0 < chg_4h <= 3.5:
+            score += 10; reasons.append(f'4H up {chg_4h:+.1f}%')
+        elif chg_4h > 3.5:
+            score += 4;  reasons.append(f'4H up {chg_4h:+.1f}% (extended)')
+        else:
+            score += 2
+
+        # ── 1H MOMENTUM (max 8) ──────────────────────────────────────────
+        if chg_1h > 0.5:
+            score += 8; reasons.append(f'1H up {chg_1h:+.1f}% strong')
+        elif chg_1h > 0.1:
+            score += 5; reasons.append(f'1H up {chg_1h:+.1f}%')
+        elif chg_1h > 0:
+            score += 2
+
+        # ── RSI (max 12) ─────────────────────────────────────────────────
+        if 50 <= rsi_now <= 60:
+            score += 12; reasons.append(f'RSI {rsi_now:.0f} sweet spot')
+        elif 45 <= rsi_now < 50:
+            score += 8;  reasons.append(f'RSI {rsi_now:.0f} accumulation')
+        elif 60 < rsi_now <= 66:
+            score += 5;  reasons.append(f'RSI {rsi_now:.0f} building')
+        elif 42 <= rsi_now < 45:
+            score += 4;  reasons.append(f'RSI {rsi_now:.0f} low')
+
+        # ── 4H SUPERTREND (max 12) ───────────────────────────────────────
+        # 5m ST is a hard VETO — not scored (avoids inflation)
+        # Only 4H alignment earns bonus points
+        _, st_dir_4h = _dst_supertrend(h4, l4, c4, 3.0, 10)
+        if float(st_dir_4h.iloc[-1]) == 1:
+            score += 12; reasons.append('4H ST ↑ aligned')
+
+        # ── PROXIMITY TO RESISTANCE (max 18, min -25) ────────────────────
+        # Key differentiator — far-from-resistance coins are just noise
+        recent_high_5m = float(h.iloc[-24:].max())
+        recent_high_4h = float(h4.iloc[-8:].max())
+        resistance = min(recent_high_5m, recent_high_4h) if recent_high_4h > close_now else recent_high_5m
+        dist_pct   = (resistance - close_now) / resistance * 100
+        if dist_pct <= 0.8:
+            score += 18; reasons.append(f'🎯 {dist_pct:.1f}% from resistance')
+        elif dist_pct <= 1.5:
+            score += 13; reasons.append(f'Near resistance ({dist_pct:.1f}%)')
+        elif dist_pct <= 3.0:
+            score += 6;  reasons.append(f'Approaching resist ({dist_pct:.1f}%)')
+        elif dist_pct <= 5.0:
+            pass  # neutral
+        else:
+            score -= 25; reasons.append(f'⚠️ Far from resist ({dist_pct:.1f}%)')
+
+        # ── STRUCTURE (max 18) ───────────────────────────────────────────
+        ema20 = float(_dst_ema(c, 20).iloc[-1])
+        if close_now > ema20:
+            score += 8; reasons.append('Above EMA20')
+
+        swing_lows = [float(l.iloc[i]) for i in range(-60, -1)
+                      if l.iloc[i] < l.iloc[i-1] and l.iloc[i] < l.iloc[i+1]]
+        if len(swing_lows) >= 3:
+            last3 = swing_lows[-3:]
+            if last3[2] > last3[1] > last3[0]:
+                score += 10; reasons.append('📐 Higher lows')
+            elif last3[2] > last3[0]:
+                score += 4
+
+        # ── CANDLE QUALITY (max 14) ──────────────────────────────────────
+        candle_range  = high_now - low_now
+        candle_body   = abs(close_now - open_now)
+        bullish_close = close_now > open_now
+        if bullish_close:
+            score += 7; reasons.append('Green close')
+        if candle_range > 0 and candle_body / candle_range >= 0.6:
+            score += 7; reasons.append('Strong body')
+
+        # ── R:R (max 10) ─────────────────────────────────────────────────
         tpsl = _gl_dynamic_tpsl(df_5m, df_4h, close_now, 'LONG')
-        return {
-            'type': 'PRE_GAINER', 'direction': 'WATCH', 'symbol': symbol,
-            'close': close_now,
-            'sl': tpsl['sl'] if tpsl else 0, 'tp': tpsl['tp'] if tpsl else 0,
-            'tp1': tpsl['tp1'] if tpsl else 0, 'tp2': tpsl['tp2'] if tpsl else 0,
-            'tp3': tpsl['tp3'] if tpsl else 0,
-            'rr': tpsl['rr'] if tpsl else 0,
-            'rsi': round(rsi_now, 1), 'chg_4h': round(chg_4h, 2),
-            'chg_1h': round(_gl_pct_change_1h(df_5m), 2), 'vol_ratio': round(vol_ratio, 2),
-            'emoji': '👀', 'label': 'PRE-GAINER WATCH',
-            'reasons': [f'Flat 4H ({round(chg_4h,1)}%)', f'RSI {round(rsi_now,1)} neutral',
-                        f'Vol {round(vol_ratio,1)}x spike', 'Near breakout level', 'ST BULLISH']
-        }
+        if not tpsl: return None
+        if tpsl['rr'] >= 2.5:
+            score += 10; reasons.append(f'R:R {tpsl["rr"]:.1f} excellent')
+        elif tpsl['rr'] >= 2.0:
+            score += 7;  reasons.append(f'R:R {tpsl["rr"]:.1f} good')
+        elif tpsl['rr'] >= 1.5:
+            score += 3;  reasons.append(f'R:R {tpsl["rr"]:.1f}')
+        else:
+            return None  # hard veto
+
+        return score, reasons, tpsl, close_now, rsi_now, vol_ratio, chg_4h, chg_1h
+
     except:
         return None
+
+
+def _score_preloser(df_5m, df_4h, s):
+    """Mirror of _score_pregainer for SHORT setups. Same weights, inverted logic."""
+    try:
+        c = df_5m['close']; h = df_5m['high']; l = df_5m['low']
+        o = df_5m['open'];  v = df_5m['volume']
+        c4 = df_4h['close']; h4 = df_4h['high']; l4 = df_4h['low']
+
+        close_now = float(c.iloc[-1])
+        open_now  = float(o.iloc[-1])
+        high_now  = float(h.iloc[-1])
+        low_now   = float(l.iloc[-1])
+
+        vol_ma    = v.rolling(20).mean()
+        volma     = float(vol_ma.iloc[-1])
+        if volma <= 0: return None
+        vol_now   = float(v.iloc[-1])
+        vol_ratio = vol_now / volma
+
+        chg_4h    = _gl_pct_change(df_4h)
+        chg_1h    = _gl_pct_change_1h(df_5m)
+        rsi_now   = float(_dst_rsi(c).iloc[-1])
+
+        # ── HARD VETOES ───────────────────────────────────────────────────
+        if vol_ratio < 2.0: return None
+        if not (-4.0 <= chg_4h <= -0.3): return None
+        _, st_dir_5m = _dst_supertrend(h, l, c, 3.0, 10)
+        if float(st_dir_5m.iloc[-1]) != -1: return None
+        if rsi_now < 32: return None
+        if rsi_now > 65: return None
+
+        score   = 0
+        reasons = []
+
+        # ── VOLUME (max 40 + bonus 10) ───────────────────────────────────
+        if vol_ratio >= 4.0:
+            score += 40; reasons.append(f'🔥 Vol {vol_ratio:.1f}x EXTREME')
+        elif vol_ratio >= 3.0:
+            score += 28; reasons.append(f'🔥 Vol {vol_ratio:.1f}x SURGE')
+        elif vol_ratio >= 2.5:
+            score += 18; reasons.append(f'⚡ Vol {vol_ratio:.1f}x spike')
+        else:
+            score += 8;  reasons.append(f'Vol {vol_ratio:.1f}x above avg')
+
+        vol_recent = float(v.iloc[-3:].mean())
+        vol_prior  = float(v.iloc[-6:-3].mean())
+        if vol_prior > 0 and vol_recent > vol_prior * 1.2:
+            score += 10; reasons.append('📈 Sell volume accelerating')
+
+        # ── 4H TREND (max 18) ────────────────────────────────────────────
+        if -2.0 <= chg_4h <= -0.5:
+            score += 18; reasons.append(f'4H down {chg_4h:+.1f}% ideal')
+        elif -3.5 <= chg_4h < -2.0:
+            score += 10; reasons.append(f'4H down {chg_4h:+.1f}%')
+        elif chg_4h < -3.5:
+            score += 4;  reasons.append(f'4H down {chg_4h:+.1f}% (extended)')
+        else:
+            score += 2
+
+        # ── 1H MOMENTUM (max 8) ──────────────────────────────────────────
+        if chg_1h < -0.5:
+            score += 8; reasons.append(f'1H down {chg_1h:+.1f}% strong')
+        elif chg_1h < -0.1:
+            score += 5; reasons.append(f'1H down {chg_1h:+.1f}%')
+        elif chg_1h < 0:
+            score += 2
+
+        # ── RSI (max 12) ─────────────────────────────────────────────────
+        if 40 <= rsi_now <= 50:
+            score += 12; reasons.append(f'RSI {rsi_now:.0f} distribution zone')
+        elif 50 < rsi_now <= 58:
+            score += 8;  reasons.append(f'RSI {rsi_now:.0f} fading')
+        elif 34 <= rsi_now < 40:
+            score += 5;  reasons.append(f'RSI {rsi_now:.0f} weak')
+        elif 58 < rsi_now <= 65:
+            score += 4;  reasons.append(f'RSI {rsi_now:.0f} high')
+
+        # ── 4H SUPERTREND (max 12) ───────────────────────────────────────
+        _, st_dir_4h = _dst_supertrend(h4, l4, c4, 3.0, 10)
+        if float(st_dir_4h.iloc[-1]) == -1:
+            score += 12; reasons.append('4H ST ↓ aligned')
+
+        # ── PROXIMITY TO SUPPORT (max 18, min -25) ───────────────────────
+        recent_low_5m = float(l.iloc[-24:].min())
+        recent_low_4h = float(l4.iloc[-8:].min())
+        support   = max(recent_low_5m, recent_low_4h) if recent_low_4h < close_now else recent_low_5m
+        dist_pct  = (close_now - support) / close_now * 100
+        if dist_pct <= 0.8:
+            score += 18; reasons.append(f'🎯 {dist_pct:.1f}% from support')
+        elif dist_pct <= 1.5:
+            score += 13; reasons.append(f'Near support ({dist_pct:.1f}%)')
+        elif dist_pct <= 3.0:
+            score += 6;  reasons.append(f'Approaching support ({dist_pct:.1f}%)')
+        elif dist_pct <= 5.0:
+            pass
+        else:
+            score -= 25; reasons.append(f'⚠️ Far from support ({dist_pct:.1f}%)')
+
+        # ── STRUCTURE (max 18) ───────────────────────────────────────────
+        ema20 = float(_dst_ema(c, 20).iloc[-1])
+        if close_now < ema20:
+            score += 8; reasons.append('Below EMA20')
+
+        swing_highs = [float(h.iloc[i]) for i in range(-60, -1)
+                       if h.iloc[i] > h.iloc[i-1] and h.iloc[i] > h.iloc[i+1]]
+        if len(swing_highs) >= 3:
+            last3 = swing_highs[-3:]
+            if last3[2] < last3[1] < last3[0]:
+                score += 10; reasons.append('📐 Lower highs')
+            elif last3[2] < last3[0]:
+                score += 4
+
+        # ── CANDLE QUALITY (max 14) ──────────────────────────────────────
+        candle_range  = high_now - low_now
+        candle_body   = abs(close_now - open_now)
+        bearish_close = close_now < open_now
+        if bearish_close:
+            score += 7; reasons.append('Red close')
+        if candle_range > 0 and candle_body / candle_range >= 0.6:
+            score += 7; reasons.append('Strong bearish body')
+
+        # ── R:R (max 10) ─────────────────────────────────────────────────
+        tpsl = _gl_dynamic_tpsl(df_5m, df_4h, close_now, 'SHORT')
+        if not tpsl: return None
+        if tpsl['rr'] >= 2.5:
+            score += 10; reasons.append(f'R:R {tpsl["rr"]:.1f} excellent')
+        elif tpsl['rr'] >= 2.0:
+            score += 7;  reasons.append(f'R:R {tpsl["rr"]:.1f} good')
+        elif tpsl['rr'] >= 1.5:
+            score += 3;  reasons.append(f'R:R {tpsl["rr"]:.1f}')
+        else:
+            return None
+
+        return score, reasons, tpsl, close_now, rsi_now, vol_ratio, chg_4h, chg_1h
+
+    except:
+        return None
+
+
+# ── CALIBRATED THRESHOLDS (validated against 10 scenarios) ──────────────────
+# Max possible score: ~160 pts
+# Watch = 65 pts (~40% of max) — good setup, worth watching
+# Star  = 95 pts (~60% of max) — elite setup, high conviction
+_PRE_SCORE_WATCH = 65   # minimum for PRE_GAINER / PRE_LOSER
+_PRE_SCORE_STAR  = 95   # minimum for ⭐ STAR (elite)
+
+
+def _gl_check_pregainer(df_5m, df_4h, s, symbol):
+    result = _score_pregainer(df_5m, df_4h, s)
+    if result is None: return None
+    score, reasons, tpsl, close_now, rsi_now, vol_ratio, chg_4h, chg_1h = result
+    if score < _PRE_SCORE_WATCH: return None
+    # Cap at PRE_GAINER level — stars handled separately
+    if score >= _PRE_SCORE_STAR: return None
+    return {
+        'type': 'PRE_GAINER', 'direction': 'LONG', 'symbol': symbol,
+        'close': close_now,
+        'sl': tpsl['sl'], 'tp': tpsl['tp'],
+        'tp1': tpsl['tp1'], 'tp2': tpsl['tp2'], 'tp3': tpsl['tp3'],
+        'rr': tpsl['rr'], 'rsi': round(rsi_now, 1),
+        'chg_4h': round(chg_4h, 2), 'chg_1h': round(chg_1h, 2),
+        'vol_ratio': round(vol_ratio, 2),
+        'conviction_score': score,
+        'emoji': '👀', 'label': f'PRE-GAINER [{score}pts]',
+        'reasons': reasons,
+    }
+
 
 def _gl_check_preloser(df_5m, df_4h, s, symbol):
-    try:
-        chg_4h = _gl_pct_change(df_4h)
-        c = df_5m['close']; h = df_5m['high']; l = df_5m['low']; v = df_5m['volume']
-        close_now = float(c.iloc[-1])
-        rsi_now   = float(_dst_rsi(c).iloc[-1])
-        vol_ma    = v.rolling(20).mean()
-        vol_now   = float(v.iloc[-1]); volma = float(vol_ma.iloc[-1])
-        if volma <= 0: return None
-        vol_ratio = vol_now / volma
-        if vol_ratio < 1.3: return None
-        if not (35 < rsi_now < 65): return None
-        recent_low = float(l.iloc[-24:].min())
-        near_breakdown = (close_now - recent_low) / close_now * 100 < 2.0
-        if not near_breakdown: return None
-        _, st_dir = _dst_supertrend(h, l, c, 3.0, 10)
-        if float(st_dir.iloc[-1]) != -1: return None
-        tpsl = _gl_dynamic_tpsl(df_5m, df_4h, close_now, 'SHORT')
-        return {
-            'type': 'PRE_LOSER', 'direction': 'WATCH', 'symbol': symbol,
-            'close': close_now,
-            'sl': tpsl['sl'] if tpsl else 0, 'tp': tpsl['tp'] if tpsl else 0,
-            'tp1': tpsl['tp1'] if tpsl else 0, 'tp2': tpsl['tp2'] if tpsl else 0,
-            'tp3': tpsl['tp3'] if tpsl else 0,
-            'rr': tpsl['rr'] if tpsl else 0,
-            'rsi': round(rsi_now, 1), 'chg_4h': round(chg_4h, 2),
-            'chg_1h': round(_gl_pct_change_1h(df_5m), 2), 'vol_ratio': round(vol_ratio, 2),
-            'emoji': '⚠️', 'label': 'PRE-LOSER WATCH',
-            'reasons': [f'Flat 4H ({round(chg_4h,1)}%)', f'RSI {round(rsi_now,1)} neutral',
-                        f'Vol {round(vol_ratio,1)}x spike', 'Near support break', 'ST BEARISH']
-        }
-    except:
-        return None
+    result = _score_preloser(df_5m, df_4h, s)
+    if result is None: return None
+    score, reasons, tpsl, close_now, rsi_now, vol_ratio, chg_4h, chg_1h = result
+    if score < _PRE_SCORE_WATCH: return None
+    if score >= _PRE_SCORE_STAR: return None
+    return {
+        'type': 'PRE_LOSER', 'direction': 'SHORT', 'symbol': symbol,
+        'close': close_now,
+        'sl': tpsl['sl'], 'tp': tpsl['tp'],
+        'tp1': tpsl['tp1'], 'tp2': tpsl['tp2'], 'tp3': tpsl['tp3'],
+        'rr': tpsl['rr'], 'rsi': round(rsi_now, 1),
+        'chg_4h': round(chg_4h, 2), 'chg_1h': round(chg_1h, 2),
+        'vol_ratio': round(vol_ratio, 2),
+        'conviction_score': score,
+        'emoji': '⚠️', 'label': f'PRE-LOSER [{score}pts]',
+        'reasons': reasons,
+    }
+
 
 def _gl_check_pregainer_star(df_5m, df_4h, s, symbol):
-    try:
-        base = _gl_check_pregainer(df_5m, df_4h, s, symbol)
-        if not base: return None
-        c = df_5m['close']; h = df_5m['high']; l = df_5m['low']; v = df_5m['volume']
-        close_now = float(c.iloc[-1])
-        # Extra conditions for ⭐ star
-        rsi_now   = float(_dst_rsi(c).iloc[-1])
-        vol_now   = float(v.iloc[-1])
-        volma     = float(v.rolling(20).mean().iloc[-1])
-        vol_ratio = vol_now / volma if volma > 0 else 0
-        # 4H confirmed bullish via chg
-        chg_4h = _gl_pct_change(df_4h)
-        if not (0.5 <= chg_4h <= 3.0): return None
-        if vol_ratio < 1.8: return None
-        if not (40 < rsi_now < 60): return None
-        recent_low = float(l.iloc[-24:].min())
-        if (close_now - recent_low) / recent_low * 100 < 1.0: return None
-        tpsl = _gl_dynamic_tpsl(df_5m, df_4h, close_now, 'LONG')
-        return {
-            'type': 'PRE_GAINER_STAR', 'direction': 'WATCH', 'symbol': symbol,
-            'close': close_now,
-            'sl': tpsl['sl'] if tpsl else 0, 'tp': tpsl['tp'] if tpsl else 0,
-            'tp1': tpsl['tp1'] if tpsl else 0, 'tp2': tpsl['tp2'] if tpsl else 0,
-            'tp3': tpsl['tp3'] if tpsl else 0,
-            'rr': tpsl['rr'] if tpsl else 0,
-            'rsi': round(rsi_now, 1), 'chg_4h': round(chg_4h, 2),
-            'chg_1h': round(_gl_pct_change_1h(df_5m), 2), 'vol_ratio': round(vol_ratio, 2),
-            'emoji': '⭐', 'label': '⭐ PRE-GAINER STAR',
-            'reasons': base['reasons'] + [f'Vol {round(vol_ratio,1)}x HIGH', 'Tight RSI range', '4H up slightly']
-        }
-    except:
-        return None
+    """Elite pre-gainer — must pass ALL hard vetoes AND score >= 115."""
+    result = _score_pregainer(df_5m, df_4h, s)
+    if result is None: return None
+    score, reasons, tpsl, close_now, rsi_now, vol_ratio, chg_4h, chg_1h = result
+    if score < _PRE_SCORE_STAR: return None
+    return {
+        'type': 'PRE_GAINER_STAR', 'direction': 'LONG', 'symbol': symbol,
+        'close': close_now,
+        'sl': tpsl['sl'], 'tp': tpsl['tp'],
+        'tp1': tpsl['tp1'], 'tp2': tpsl['tp2'], 'tp3': tpsl['tp3'],
+        'rr': tpsl['rr'], 'rsi': round(rsi_now, 1),
+        'chg_4h': round(chg_4h, 2), 'chg_1h': round(chg_1h, 2),
+        'vol_ratio': round(vol_ratio, 2),
+        'conviction_score': score,
+        'emoji': '⭐', 'label': f'⭐ PRE-GAINER STAR [{score}pts]',
+        'reasons': reasons,
+    }
+
 
 def _gl_check_preloser_star(df_5m, df_4h, s, symbol):
-    try:
-        base = _gl_check_preloser(df_5m, df_4h, s, symbol)
-        if not base: return None
-        c = df_5m['close']; h = df_5m['high']; l = df_5m['low']; v = df_5m['volume']
-        close_now = float(c.iloc[-1])
-        rsi_now   = float(_dst_rsi(c).iloc[-1])
-        vol_now   = float(v.iloc[-1])
-        volma     = float(v.rolling(20).mean().iloc[-1])
-        vol_ratio = vol_now / volma if volma > 0 else 0
-        chg_4h    = _gl_pct_change(df_4h)
-        if not (-3.0 <= chg_4h <= -0.5): return None
-        if vol_ratio < 1.8: return None
-        if not (40 < rsi_now < 60): return None
-        recent_high = float(h.iloc[-24:].max())
-        if (recent_high - close_now) / recent_high * 100 < 1.0: return None
-        tpsl = _gl_dynamic_tpsl(df_5m, df_4h, close_now, 'SHORT')
-        return {
-            'type': 'PRE_LOSER_STAR', 'direction': 'WATCH', 'symbol': symbol,
-            'close': close_now,
-            'sl': tpsl['sl'] if tpsl else 0, 'tp': tpsl['tp'] if tpsl else 0,
-            'tp1': tpsl['tp1'] if tpsl else 0, 'tp2': tpsl['tp2'] if tpsl else 0,
-            'tp3': tpsl['tp3'] if tpsl else 0,
-            'rr': tpsl['rr'] if tpsl else 0,
-            'rsi': round(rsi_now, 1), 'chg_4h': round(chg_4h, 2),
-            'chg_1h': round(_gl_pct_change_1h(df_5m), 2), 'vol_ratio': round(vol_ratio, 2),
-            'emoji': '⭐', 'label': '⭐ PRE-LOSER STAR',
-            'reasons': base['reasons'] + [f'Vol {round(vol_ratio,1)}x HIGH', 'Tight RSI range', '4H down slightly']
-        }
-    except:
-        return None
+    """Elite pre-loser — must pass ALL hard vetoes AND score >= 115."""
+    result = _score_preloser(df_5m, df_4h, s)
+    if result is None: return None
+    score, reasons, tpsl, close_now, rsi_now, vol_ratio, chg_4h, chg_1h = result
+    if score < _PRE_SCORE_STAR: return None
+    return {
+        'type': 'PRE_LOSER_STAR', 'direction': 'SHORT', 'symbol': symbol,
+        'close': close_now,
+        'sl': tpsl['sl'], 'tp': tpsl['tp'],
+        'tp1': tpsl['tp1'], 'tp2': tpsl['tp2'], 'tp3': tpsl['tp3'],
+        'rr': tpsl['rr'], 'rsi': round(rsi_now, 1),
+        'chg_4h': round(chg_4h, 2), 'chg_1h': round(chg_1h, 2),
+        'vol_ratio': round(vol_ratio, 2),
+        'conviction_score': score,
+        'emoji': '⭐', 'label': f'⭐ PRE-LOSER STAR [{score}pts]',
+        'reasons': reasons,
+    }
 
 
 # ─── MAIN SCAN FUNCTION ──────────────────────────────────────────────────────
@@ -1366,6 +1640,22 @@ if gl_results:
             chg_color = '#34d399' if sig.get('chg_4h',0) >= 0 else '#f87171'
             dir_badge_bg = '#0b2d1a' if sig.get('direction') == 'LONG' else ('#2d0a0a' if sig.get('direction') == 'SHORT' else '#1e293b')
             dir_badge_c  = '#34d399' if sig.get('direction') == 'LONG' else ('#f87171' if sig.get('direction') == 'SHORT' else '#94a3b8')
+            # Conviction score bar for pre-signals
+            _conv_score = sig.get('conviction_score', 0)
+            _conv_html = ''
+            if _conv_score > 0:
+                _bar_w   = min(100, int(_conv_score / 185 * 100))
+                _bar_c   = '#fbbf24' if _conv_score < _PRE_SCORE_STAR else '#10b981'
+                _bar_lbl = '⭐ ELITE' if _conv_score >= _PRE_SCORE_STAR else ('🔥 HIGH' if _conv_score >= 100 else '👀 WATCH')
+                _conv_html = f'''<div style="margin:5px 0 4px;">
+                  <div style="display:flex;justify-content:space-between;font-family:monospace;font-size:.58rem;color:#64748b;margin-bottom:3px;">
+                    <span>Conviction Score: <b style="color:{_bar_c};">{_conv_score}pts</b></span>
+                    <span style="color:{_bar_c};font-weight:700;">{_bar_lbl}</span>
+                  </div>
+                  <div style="background:#0f172a;border-radius:4px;height:5px;">
+                    <div style="height:5px;width:{_bar_w}%;background:{_bar_c};border-radius:4px;"></div>
+                  </div>
+                </div>'''
             st.markdown(f'''
             <div style="background:{bg};border:1px solid {border}50;border-left:4px solid {accent};
               border-radius:10px;padding:12px 16px;margin:5px 0;">
@@ -1395,6 +1685,8 @@ if gl_results:
               </div>
               <!-- Row 3: TP/SL -->
               <div style="font-family:monospace;font-size:.62rem;color:#94a3b8;margin-top:4px;">{tp_sl}</div>
+              <!-- Conviction bar (pre-signals only) -->
+              {_conv_html}
               <!-- Row 4: reasons -->
               {f'<div style="font-family:monospace;font-size:.58rem;color:#475569;margin-top:4px;line-height:1.5;">{reasons}</div>' if reasons else ''}
             </div>''', unsafe_allow_html=True)
