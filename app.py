@@ -944,124 +944,177 @@ def send_gl_discord_alert(webhook_url, sig):
         pass
 
 
-# ─── PERFORMANCE TRACKER ─────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# SIGNAL JOURNAL — COMPREHENSIVE TRACKING SYSTEM
+# ═══════════════════════════════════════════════════════════════════════════
+_JOURNAL_COLS = [
+    'signal_id','timestamp_utc','timestamp_pkt',
+    'symbol','type','direction','conviction_score',
+    'entry','tp1','tp2','tp3','sl','rr',
+    'chg_4h','chg_1h','rsi','vol_ratio',
+    'outcome','outcome_time','pnl_pct',
+    'max_fav_pct','max_adv_pct','time_to_outcome_hrs',
+    'p1h','p4h','p8h','p24h','notes'
+]
+
 def ensure_gl_performance():
-    _hourly_cols = []
-    for _h in range(1, 25):
-        _hourly_cols += [f'h{_h}_price', f'h{_h}_pct']
-    headers = ['signal_id','timestamp_utc','timestamp_pkt','symbol','type','direction',
-               'entry','tp','sl','rr','chg_4h','chg_1h','rsi','vol_ratio',
-               'outcome','outcome_time','pnl_pct','bars_to_outcome',
-               'max_move_pct','max_move_price','max_move_time',
-               'final_price','final_pct','final_report'] + _hourly_cols
     if not os.path.exists(GL_PERF_FILE):
         with open(GL_PERF_FILE, 'w', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(headers)
+            csv.writer(f).writerow(_JOURNAL_COLS)
     else:
         try:
-            _df = pd.read_csv(GL_PERF_FILE); changed = False
-            for col in headers:
-                if col not in _df.columns:
-                    _df[col] = ''; changed = True
-            if changed: _df.to_csv(GL_PERF_FILE, index=False)
-        except:
-            pass
+            df = pd.read_csv(GL_PERF_FILE); changed = False
+            for col in _JOURNAL_COLS:
+                if col not in df.columns:
+                    df[col] = ''; changed = True
+            if changed: df.to_csv(GL_PERF_FILE, index=False)
+        except: pass
 
 def log_gl_signal(sig):
+    """Log a new signal with full context. Deduplicates by hourly signal_id."""
     try:
         ensure_gl_performance()
-        signal_id = f"{sig['symbol']}_{sig['type']}_{sig.get('scan_time','')}"
+        _ts   = sig.get('scan_time', datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'))
+        _hour = _ts[:13].replace(' ','_').replace(':','')
+        signal_id = f"{sig['symbol'].replace('/','').replace(':','')}_{sig['type']}_{_hour}"
         if os.path.exists(GL_PERF_FILE):
             df = pd.read_csv(GL_PERF_FILE)
             if signal_id in df['signal_id'].values: return
+        entry = float(sig.get('close', 0))
         with open(GL_PERF_FILE, 'a', newline='', encoding='utf-8') as f:
             csv.writer(f).writerow([
-                signal_id, sig.get('scan_time',''), sig.get('scan_time_pkt',''),
+                signal_id,
+                sig.get('scan_time',''), sig.get('scan_time_pkt',''),
                 sig.get('symbol',''), sig.get('type',''), sig.get('direction',''),
-                sig.get('close',''), sig.get('tp',''), sig.get('sl',''), sig.get('rr',''),
-                sig.get('chg_4h',''), sig.get('chg_1h',''), sig.get('rsi',''), sig.get('vol_ratio',''),
-                'PENDING','','','','','',''
+                sig.get('conviction_score',''),
+                entry,
+                float(sig.get('tp1', sig.get('tp',0))),
+                float(sig.get('tp2', sig.get('tp',0))),
+                float(sig.get('tp3', sig.get('tp',0))),
+                float(sig.get('sl',0)),
+                sig.get('rr',''), sig.get('chg_4h',''), sig.get('chg_1h',''),
+                sig.get('rsi',''), sig.get('vol_ratio',''),
+                'PENDING','','','','','','','','','',''
             ])
+        print(f"[JOURNAL] Logged: {signal_id}")
     except Exception as e:
-        print(f"[GL PERF] Log error: {e}")
+        print(f"[JOURNAL] Log error: {e}")
 
 def check_gl_outcomes():
+    """Check all PENDING signals — resolve TP1/TP2/TP3/SL and track checkpoints."""
     try:
-        if not os.path.exists(GL_PERF_FILE): return
+        if not os.path.exists(GL_PERF_FILE): return 0
         df = pd.read_csv(GL_PERF_FILE)
         pending = df[df['outcome'] == 'PENDING']
-        if pending.empty: return
+        if pending.empty: return 0
         import ccxt as _ccxt
         ex = _ccxt.gate({'enableRateLimit': True, 'options': {'defaultType': 'swap'}})
+        updated = 0
         for idx, row in pending.iterrows():
             try:
-                sym    = row['symbol']
-                entry  = float(row['entry'])
-                tp     = float(row['tp'])  if str(row['tp'])  not in ['', 'nan'] else None
-                sl     = float(row['sl'])  if str(row['sl'])  not in ['', 'nan'] else None
-                if not tp or not sl: continue
+                sym       = str(row['symbol'])
+                entry     = float(row['entry'])
+                tp1       = float(row['tp1']) if str(row.get('tp1','')) not in ['','nan','0'] else None
+                tp2       = float(row['tp2']) if str(row.get('tp2','')) not in ['','nan','0'] else None
+                tp3       = float(row['tp3']) if str(row.get('tp3','')) not in ['','nan','0'] else None
+                sl        = float(row['sl'])  if str(row.get('sl',''))  not in ['','nan','0'] else None
+                direction = str(row.get('direction','LONG'))
+                if not sl or entry <= 0: continue
                 try:
-                    sig_time  = pd.to_datetime(row['timestamp_utc'])
-                    age_hours = (pd.Timestamp.utcnow() - sig_time.replace(tzinfo=None)).total_seconds() / 3600
-                    if age_hours > 24:
-                        df.at[idx, 'outcome']      = 'EXPIRED'
-                        df.at[idx, 'outcome_time'] = _dual_time()[0]
-                        continue
-                except:
-                    pass
-                ticker  = ex.fetch_ticker(sym)
-                current = float(ticker['last'])
+                    age_hrs = (datetime.utcnow() - pd.to_datetime(str(row['timestamp_utc'])[:19])).total_seconds()/3600
+                except: age_hrs = 0
+                if age_hrs > 48:
+                    df.at[idx,'outcome'] = 'EXPIRED'
+                    df.at[idx,'outcome_time'] = _dual_time()[0]
+                    df.at[idx,'time_to_outcome_hrs'] = round(age_hrs,1)
+                    updated += 1; continue
                 try:
-                    _prev_max = float(row['max_move_pct']) if str(row.get('max_move_pct','')) not in ['','nan'] else 0.0
-                    direction = str(row.get('direction',''))
-                    if direction == 'LONG' or str(row.get('type','')) in ['PRE_GAINER','GAINER_PULLBACK','GAINER_BREAKOUT','LOSER_BOUNCE']:
-                        _move_pct = (current - entry) / entry * 100
-                    else:
-                        _move_pct = (entry - current) / entry * 100
-                    if abs(_move_pct) > abs(_prev_max):
-                        df.at[idx, 'max_move_pct']   = round(_move_pct, 3)
-                        df.at[idx, 'max_move_price']  = round(current, 6)
-                        df.at[idx, 'max_move_time']   = _dual_time()[0]
-                except: pass
-                direction = str(row['direction'])
+                    current = float(ex.fetch_ticker(sym)['last'])
+                except: continue
+                # Favourable / adverse move tracking
+                fav = (current-entry)/entry*100 if direction=='LONG' else (entry-current)/entry*100
+                adv = (entry-current)/entry*100 if direction=='LONG' else (current-entry)/entry*100
+                if fav > float(row.get('max_fav_pct') or 0): df.at[idx,'max_fav_pct'] = round(fav,3)
+                if adv > float(row.get('max_adv_pct') or 0): df.at[idx,'max_adv_pct'] = round(adv,3)
+                # Price checkpoints
+                raw_pct = fav if direction=='LONG' else -adv
+                for _h,_col in [(1,'p1h'),(4,'p4h'),(8,'p8h'),(24,'p24h')]:
+                    if age_hrs >= _h and str(row.get(_col,'')) in ['','nan']:
+                        df.at[idx,_col] = round(raw_pct,3)
+                # Outcome resolution — TP3 > TP2 > TP1 > SL
+                outcome = None; pnl = None
                 if direction == 'LONG':
-                    if current >= tp:
-                        df.at[idx, 'outcome']      = 'WIN';  df.at[idx, 'pnl_pct'] = round((tp - entry)/entry*100, 2)
-                        df.at[idx, 'outcome_time'] = _dual_time()[0]
-                    elif current <= sl:
-                        df.at[idx, 'outcome']      = 'LOSS'; df.at[idx, 'pnl_pct'] = round((sl - entry)/entry*100, 2)
-                        df.at[idx, 'outcome_time'] = _dual_time()[0]
-                elif direction == 'SHORT':
-                    if current <= tp:
-                        df.at[idx, 'outcome']      = 'WIN';  df.at[idx, 'pnl_pct'] = round((entry - tp)/entry*100, 2)
-                        df.at[idx, 'outcome_time'] = _dual_time()[0]
-                    elif current >= sl:
-                        df.at[idx, 'outcome']      = 'LOSS'; df.at[idx, 'pnl_pct'] = round((entry - sl)/entry*100, 2)
-                        df.at[idx, 'outcome_time'] = _dual_time()[0]
+                    if tp3 and current >= tp3: outcome='WIN_TP3'; pnl=(tp3-entry)/entry*100
+                    elif tp2 and current >= tp2: outcome='WIN_TP2'; pnl=(tp2-entry)/entry*100
+                    elif tp1 and current >= tp1: outcome='WIN_TP1'; pnl=(tp1-entry)/entry*100
+                    elif current <= sl: outcome='LOSS'; pnl=(sl-entry)/entry*100
+                else:
+                    if tp3 and current <= tp3: outcome='WIN_TP3'; pnl=(entry-tp3)/entry*100
+                    elif tp2 and current <= tp2: outcome='WIN_TP2'; pnl=(entry-tp2)/entry*100
+                    elif tp1 and current <= tp1: outcome='WIN_TP1'; pnl=(entry-tp1)/entry*100
+                    elif current >= sl: outcome='LOSS'; pnl=(entry-sl)/entry*100
+                if outcome:
+                    df.at[idx,'outcome'] = outcome
+                    df.at[idx,'pnl_pct'] = round(pnl,3)
+                    df.at[idx,'outcome_time'] = _dual_time()[0]
+                    df.at[idx,'time_to_outcome_hrs'] = round(age_hrs,1)
+                    updated += 1
+                    print(f"[JOURNAL] {sym} → {outcome} | {pnl:+.2f}%")
             except: continue
-        df.to_csv(GL_PERF_FILE, index=False)
+        if updated > 0: df.to_csv(GL_PERF_FILE, index=False)
+        return updated
     except Exception as e:
-        print(f"[GL PERF] Outcome check error: {e}")
+        print(f"[JOURNAL] Outcome check error: {e}"); return 0
 
 def get_gl_stats():
+    """Comprehensive stats: win rate, profit factor, avg time, conviction correlation."""
     try:
         if not os.path.exists(GL_PERF_FILE): return {}
         df = pd.read_csv(GL_PERF_FILE)
+        if df.empty: return {}
+        df['is_win']  = df['outcome'].str.startswith('WIN').fillna(False)
+        df['is_loss'] = df['outcome'] == 'LOSS'
+        df['pnl']     = pd.to_numeric(df['pnl_pct'], errors='coerce').fillna(0)
+        df['conv']    = pd.to_numeric(df.get('conviction_score', pd.Series(dtype=float)), errors='coerce').fillna(0)
         stats = {}
         for sig_type in ['GAINER_PULLBACK','GAINER_BREAKOUT','LOSER_BOUNCE','LOSER_BREAKDOWN',
                          'PRE_GAINER','PRE_LOSER','PRE_GAINER_STAR','PRE_LOSER_STAR']:
-            subset  = df[df['type'] == sig_type]
-            wins    = len(subset[subset['outcome'] == 'WIN'])
-            losses  = len(subset[subset['outcome'] == 'LOSS'])
-            pending = len(subset[subset['outcome'] == 'PENDING'])
-            expired = len(subset[subset['outcome'] == 'EXPIRED'])
-            total   = wins + losses
-            wr      = round(wins/total*100) if total > 0 else 0
-            avg_pnl = round(subset[subset['outcome'].isin(['WIN','LOSS'])]['pnl_pct'].astype(float).mean(), 2) if total > 0 else 0
-            stats[sig_type] = {'wins':wins,'losses':losses,'pending':pending,'expired':expired,'total':total,'wr':wr,'avg_pnl':avg_pnl}
+            sub    = df[df['type'] == sig_type]
+            closed = sub[sub['outcome'].isin(['WIN_TP1','WIN_TP2','WIN_TP3','LOSS'])]
+            wins   = sub[sub['is_win']]; losses = sub[sub['is_loss']]
+            total  = len(closed); wr = round(len(wins)/total*100) if total > 0 else 0
+            gross_win = wins['pnl'].sum(); gross_loss = abs(losses['pnl'].sum())
+            pf = round(gross_win/gross_loss,2) if gross_loss > 0 else (99.0 if gross_win > 0 else 0)
+            hc = closed[closed['conv'] >= 95]
+            tto = pd.to_numeric(closed.get('time_to_outcome_hrs', pd.Series(dtype=float)), errors='coerce')
+            stats[sig_type] = {
+                'wins': len(wins), 'losses': len(losses),
+                'pending': len(sub[sub['outcome']=='PENDING']),
+                'expired': len(sub[sub['outcome']=='EXPIRED']),
+                'total': total, 'wr': wr,
+                'avg_pnl': round(closed['pnl'].mean(),2) if total > 0 else 0,
+                'avg_win':  round(wins['pnl'].mean(),2)  if len(wins)  > 0 else 0,
+                'avg_loss': round(losses['pnl'].mean(),2) if len(losses) > 0 else 0,
+                'profit_factor': pf,
+                'high_conv_wr':    round(len(hc[hc['is_win']])/len(hc)*100) if len(hc) > 0 else None,
+                'high_conv_total': len(hc),
+                'avg_tto_hrs': round(tto.mean(),1) if len(tto.dropna()) > 0 else 0,
+            }
         return stats
-    except:
-        return {}
+    except Exception as e:
+        print(f"[JOURNAL] Stats error: {e}"); return {}
+
+def get_journal_df():
+    """Return full journal as a cleaned DataFrame for display/export."""
+    try:
+        if not os.path.exists(GL_PERF_FILE): return pd.DataFrame()
+        df = pd.read_csv(GL_PERF_FILE)
+        for col in ['pnl_pct','conviction_score','rr','rsi','vol_ratio','chg_4h','chg_1h','max_fav_pct','max_adv_pct']:
+            if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+        df['is_win'] = df['outcome'].str.startswith('WIN').fillna(False)
+        return df.sort_values('timestamp_utc', ascending=False)
+    except: return pd.DataFrame()
+
 
 
 # ─── AI ANALYSIS (Groq) ──────────────────────────────────────────────────────
